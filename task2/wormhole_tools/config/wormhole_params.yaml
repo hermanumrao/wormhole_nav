@@ -1,0 +1,8 @@
+wormhole_recorder:
+  ros__parameters:
+    db_path: "/home/herman/wormholes.db"
+    map_from: "room4"
+    map_to: "room1"
+    map1_yaml: "/home/herman/maps/map4.yaml"
+    map2_yaml: "/home/herman/maps/map1.yaml"
+

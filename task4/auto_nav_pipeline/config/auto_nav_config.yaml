@@ -1,0 +1,15 @@
+auto_nav_pipeline_node:
+  ros__parameters:
+    spawn_pose:
+      x: -2.0
+      y: 0.5
+      z: 0.1
+
+    goal_pose:
+      x: 2.5
+      y: 0.7
+      z: 0.0
+
+    map: "/home/herman/maps/map1.yaml"
+
+    world_launch_file: "turtlebot3_world.launch.py"

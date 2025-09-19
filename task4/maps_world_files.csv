@@ -1,0 +1,5 @@
+map_number,map_file,world_launch_file
+room1,/home/herman/maps/map1.yaml,turtlebot3_world.launch.py
+room3,/home/herman/maps/map3.yaml,turtlebot3_office.launch.py
+room4,/home/herman/maps/map4.yaml,turtlebot3_lab.launch.py
+

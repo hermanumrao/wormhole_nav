@@ -1,0 +1,269 @@
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <map_msgs/msg/occupancy_grid_update.hpp>
+
+#include <sqlite3.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2_ros/static_transform_broadcaster.h>
+
+#include <yaml-cpp/yaml.h>
+#include <opencv2/opencv.hpp>
+#include <filesystem>
+
+class WormholeRecorder : public rclcpp::Node {
+public:
+  WormholeRecorder() : Node("wormhole_recorder") {
+    // Parameters from config
+    db_path_   = this->declare_parameter<std::string>("db_path", "/tmp/wormholes.db");
+    map_from_  = this->declare_parameter<std::string>("map_from", "roomA");
+    map_to_    = this->declare_parameter<std::string>("map_to", "roomB");
+    map1_path_ = this->declare_parameter<std::string>("map1_yaml", "");
+    map2_path_ = this->declare_parameter<std::string>("map2_yaml", "");
+
+    // Open SQLite DB
+    if (sqlite3_open(db_path_.c_str(), &db_) != SQLITE_OK) {
+      RCLCPP_FATAL(get_logger(), "Failed to open DB: %s", sqlite3_errmsg(db_));
+      rclcpp::shutdown();
+    }
+    createTable();
+
+    // Publishers
+    pub_map1_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+      "map1", rclcpp::QoS(1).transient_local().reliable());
+    pub_map2_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+      "map2", rclcpp::QoS(1).transient_local().reliable());
+    pub_active_map_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+      "map", rclcpp::QoS(1).transient_local().reliable());
+    pub_map_updates_ = this->create_publisher<map_msgs::msg::OccupancyGridUpdate>(
+      "map_updates", rclcpp::QoS(1).transient_local().reliable());
+
+    // TF broadcaster
+    tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+
+    // Load maps
+    if (!map1_path_.empty()) {
+      active_map_ = loadMap(map1_path_);
+      active_map_.header.frame_id = "map";
+      pub_map1_->publish(active_map_);
+      pub_active_map_->publish(active_map_);
+      publishUpdate(active_map_);
+      RCLCPP_INFO(get_logger(), "Published map1 as /map1 and /map");
+    }
+    if (!map2_path_.empty()) {
+      auto msg = loadMap(map2_path_);
+      msg.header.frame_id = "map2";
+      pub_map2_->publish(msg);
+      RCLCPP_INFO(get_logger(), "Published map2 as /map2");
+    }
+
+    // Broadcast static TF: map → base_link
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = this->get_clock()->now();
+    tf.header.frame_id = "map";
+    tf.child_frame_id = "base_link";
+    tf.transform.translation.x = 0.0;
+    tf.transform.translation.y = 0.0;
+    tf.transform.translation.z = 0.0;
+    tf.transform.rotation.w = 1.0;
+    tf_broadcaster_->sendTransform(tf);
+
+    // Subscribers
+    sub_initialpose_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      "/initialpose", 10,
+      std::bind(&WormholeRecorder::initialPoseCallback, this, std::placeholders::_1));
+    sub_goalpose_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+      "/goal_pose", 10,
+      std::bind(&WormholeRecorder::goalPoseCallback, this, std::placeholders::_1));
+
+    // Timer for continuous republish
+    timer_ = this->create_wall_timer(
+      std::chrono::seconds(1),
+      [this]() {
+        if (active_map_.info.width > 0) {
+          active_map_.header.stamp = this->get_clock()->now();
+          pub_active_map_->publish(active_map_);
+          publishUpdate(active_map_);
+        }
+      });
+
+    RCLCPP_INFO(get_logger(), "Ready to record wormhole between %s and %s",
+                map_from_.c_str(), map_to_.c_str());
+  }
+
+  ~WormholeRecorder() {
+    if (db_) sqlite3_close(db_);
+  }
+
+private:
+  // ---------- Map Loader ----------
+  nav_msgs::msg::OccupancyGrid loadMap(const std::string &yaml_file) {
+    YAML::Node config = YAML::LoadFile(yaml_file);
+    std::string image_file = config["image"].as<std::string>();
+
+    // Resolve relative path
+    if (image_file.find("/") != 0) {
+      auto yaml_dir = std::filesystem::path(yaml_file).parent_path();
+      image_file = (yaml_dir / image_file).string();
+    }
+
+    double resolution = config["resolution"].as<double>();
+    double origin_x = config["origin"][0].as<double>();
+    double origin_y = config["origin"][1].as<double>();
+
+    cv::Mat image = cv::imread(image_file, cv::IMREAD_GRAYSCALE);
+    if (image.empty()) {
+      RCLCPP_ERROR(get_logger(), "Failed to load map image: %s", image_file.c_str());
+    } else {
+      RCLCPP_INFO(get_logger(), "Loaded map %s (%d x %d)", image_file.c_str(), image.cols, image.rows);
+    }
+
+    nav_msgs::msg::OccupancyGrid grid;
+    grid.info.resolution = resolution;
+    grid.info.width = image.cols;
+    grid.info.height = image.rows;
+    grid.info.origin.position.x = origin_x;
+    grid.info.origin.position.y = origin_y;
+    grid.info.origin.orientation.w = 1.0;
+
+    grid.data.resize(image.cols * image.rows);
+    for (int y = 0; y < image.rows; y++) {
+      for (int x = 0; x < image.cols; x++) {
+        uint8_t pixel = image.at<uint8_t>(y, x);
+        int idx = (image.rows - y - 1) * image.cols + x; // flip y
+        grid.data[idx] = (pixel < 127) ? 100 : 0;
+      }
+    }
+    return grid;
+  }
+
+  void publishUpdate(const nav_msgs::msg::OccupancyGrid &msg) {
+    map_msgs::msg::OccupancyGridUpdate update;
+    update.header.stamp = this->get_clock()->now();
+    update.header.frame_id = "map";
+    update.x = 0;
+    update.y = 0;
+    update.width = msg.info.width;
+    update.height = msg.info.height;
+    update.data = msg.data;
+    pub_map_updates_->publish(update);
+  }
+
+  // ---------- DB ----------
+  void createTable() {
+    const char *sql =
+      "CREATE TABLE IF NOT EXISTS wormholes ("
+      "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+      "map_from TEXT, map_to TEXT,"
+      "pose_x REAL, pose_y REAL, pose_yaw REAL,"
+      "map_to_pose_x REAL, map_to_pose_y REAL, map_to_pose_yaw REAL"
+      ");";
+    char *errmsg;
+    if (sqlite3_exec(db_, sql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
+      RCLCPP_ERROR(get_logger(), "Failed to create table: %s", errmsg);
+      sqlite3_free(errmsg);
+    }
+  }
+
+  double quaternionToYaw(const geometry_msgs::msg::Quaternion &q) {
+    tf2::Quaternion quat(q.x, q.y, q.z, q.w);
+    tf2::Matrix3x3 m(quat);
+    double roll, pitch, yaw;
+    m.getRPY(roll, pitch, yaw);
+    return yaw;
+  }
+
+  void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+    pose1_x_ = msg->pose.pose.position.x;
+    pose1_y_ = msg->pose.pose.position.y;
+    pose1_yaw_ = quaternionToYaw(msg->pose.pose.orientation);
+    got_pose1_ = true;
+    RCLCPP_INFO(get_logger(), "Got Pose1 (%s): (%.2f, %.2f, %.2f)",
+                map_from_.c_str(), pose1_x_, pose1_y_, pose1_yaw_);
+    tryInsert();
+  }
+
+  void goalPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+    pose2_x_ = msg->pose.position.x;
+    pose2_y_ = msg->pose.position.y;
+    pose2_yaw_ = quaternionToYaw(msg->pose.orientation);
+    got_pose2_ = true;
+    RCLCPP_INFO(get_logger(), "Got Pose2 (%s): (%.2f, %.2f, %.2f)",
+                map_to_.c_str(), pose2_x_, pose2_y_, pose2_yaw_);
+    tryInsert();
+  }
+
+  void tryInsert() {
+    if (got_pose1_ && got_pose2_) {
+      std::string sql = "INSERT INTO wormholes "
+        "(map_from, map_to, pose_x, pose_y, pose_yaw, "
+        "map_to_pose_x, map_to_pose_y, map_to_pose_yaw) VALUES (" +
+        quote(map_from_) + "," + quote(map_to_) + "," +
+        std::to_string(pose1_x_) + "," + std::to_string(pose1_y_) + "," + std::to_string(pose1_yaw_) + "," +
+        std::to_string(pose2_x_) + "," + std::to_string(pose2_y_) + "," + std::to_string(pose2_yaw_) + ");";
+
+      char *errmsg;
+      if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        RCLCPP_ERROR(get_logger(), "Insert failed: %s", errmsg);
+        sqlite3_free(errmsg);
+      } else {
+        RCLCPP_INFO(get_logger(), "Wormhole saved successfully!");
+        got_pose1_ = got_pose2_ = false;
+      }
+      
+    }
+    if (got_pose1_ || got_pose2_) {
+    RCLCPP_INFO(get_logger(), "Wormhole start has been recoded! Switching active map to %s", map_to_.c_str());
+
+		  // Switch active map
+		  auto new_map = loadMap(map2_path_);
+		  new_map.header.frame_id = "map";
+		  active_map_ = new_map;
+		  pub_active_map_->publish(active_map_);
+		  publishUpdate(active_map_);
+      }
+    
+  }
+
+  std::string quote(const std::string &s) {
+    return "'" + s + "'";
+  }
+
+  // DB
+  sqlite3 *db_;
+  std::string db_path_;
+  std::string map_from_, map_to_;
+  std::string map1_path_, map2_path_;
+
+  // Publishers
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_map1_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_map2_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_active_map_;
+  rclcpp::Publisher<map_msgs::msg::OccupancyGridUpdate>::SharedPtr pub_map_updates_;
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_broadcaster_;
+
+  // Subscribers
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_initialpose_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_goalpose_;
+
+  // Timer
+  rclcpp::TimerBase::SharedPtr timer_;
+  nav_msgs::msg::OccupancyGrid active_map_;
+
+  // Data
+  bool got_pose1_{false}, got_pose2_{false};
+  double pose1_x_, pose1_y_, pose1_yaw_;
+  double pose2_x_, pose2_y_, pose2_yaw_;
+};
+
+int main(int argc, char **argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<WormholeRecorder>());
+  rclcpp::shutdown();
+  return 0;
+}
+
+
