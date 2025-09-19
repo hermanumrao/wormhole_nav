@@ -24,3 +24,5 @@ pls add this to your system:
 1. [collection of gazebo worlds](https://github.com/leonhartyao/gazebo_models_worlds_collection)
 2. turtlebot3
 3. nav2
+
+### * Please finnd additional steps in each task folder's readme
